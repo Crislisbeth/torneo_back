@@ -1,0 +1,206 @@
+// backend/routes/partidos.js
+const express = require('express');
+const router = express.Router();
+const auth = require('../middleware/auth');
+const Torneo = require('../models/Torneo');
+const Equipo = require('../models/Equipo');
+const Partido = require('../models/Partido');
+
+/**
+ * POST /api/partidos/automatico - RF-004: Programar partidos automáticamente
+ */
+router.post('/automatico', auth, async (req, res) => {
+  const { torneoId } = req.body;
+
+  try {
+    if (!torneoId) {
+      return res.status(400).json({ msg: 'ID del torneo requerido' });
+    }
+
+    const torneo = await Torneo.findById(torneoId);
+    if (!torneo) {
+      return res.status(404).json({ msg: 'Torneo no encontrado' });
+    }
+
+    if (torneo.estado !== 'activo') {
+      return res.status(400).json({ msg: 'Solo se pueden programar partidos en torneos activos' });
+    }
+
+    const equipos = await Equipo.find({
+      torneo: torneoId,
+      estado: 'aprobado'
+    });
+
+    if (equipos.length < 2) {
+      return res.status(400).json({ msg: 'Se necesitan al menos 2 equipos aprobados' });
+    }
+
+    const partidos = [];
+    const fechaInicio = new Date(torneo.fechaInicio);
+    let fecha = new Date(fechaInicio);
+    let hora = 10;
+
+    if (torneo.formato === 'grupos') {
+      for (let i = 0; i < equipos.length; i++) {
+        for (let j = i + 1; j < equipos.length; j++) {
+          partidos.push({
+            torneo: torneoId,
+            equipoLocal: equipos[i]._id,
+            equipoVisitante: equipos[j]._id,
+            fecha: new Date(fecha),
+            hora: `${hora}:00`,
+            lugar: 'Cancha Principal',
+            estado: 'programado',
+            disciplina: torneo.disciplina,
+            nombreTorneo: torneo.nombre,
+          });
+          hora += 2;
+          if (hora >= 18) {
+            fecha.setDate(fecha.getDate() + 1);
+            hora = 10;
+          }
+        }
+      }
+    } else if (torneo.formato === 'eliminación directa') {
+      let equiposRonda = [...equipos];
+      let ronda = 1;
+
+      while (equiposRonda.length > 1) {
+        const partidosRonda = [];
+        for (let i = 0; i < equiposRonda.length; i += 2) {
+          if (equiposRonda[i + 1]) {
+            partidos.push({
+              torneo: torneoId,
+              equipoLocal: equiposRonda[i]._id,
+              equipoVisitante: equiposRonda[i + 1]._id,
+              fecha: new Date(fecha),
+              hora: `${hora}:00`,
+              lugar: 'Cancha Principal',
+              estado: 'programado',
+              ronda,
+              disciplina: torneo.disciplina,
+              nombreTorneo: torneo.nombre,
+            });
+            partidosRonda.push(equiposRonda[i]);
+            hora += 2;
+            if (hora >= 18) {
+              fecha.setDate(fecha.getDate() + 1);
+              hora = 10;
+            }
+          }
+        }
+        equiposRonda = partidosRonda;
+        ronda++;
+      }
+    }
+
+    await Partido.insertMany(partidos);
+
+    res.json({
+      msg: `✅ Se programaron ${partidos.length} partidos`,
+      partidos
+    });
+  } catch (err) {
+    console.error('❌ Error:', err.message);
+    res.status(500).send('Error en el servidor');
+  }
+});
+
+/**
+ * GET /api/partidos - Listar todos los partidos con ganador poblado
+ */
+router.get('/', auth, async (req, res) => {
+  try {
+    const partidos = await Partido.find()
+      .populate('equipoLocal', 'nombre')
+      .populate('equipoVisitante', 'nombre')
+      .populate('torneo', 'nombre')
+      .populate('resultado.ganador') // ✅ Poblar el ganador como objeto
+      .sort({ fecha: 1, hora: 1 });
+
+    res.json({ partidos });
+  } catch (err) {
+    console.error(err.message);
+    res.status(500).send('Error en el servidor');
+  }
+});
+
+/**
+ * PUT /api/partidos/:id/registrar-resultado - Registrar resultado de un partido
+ */
+router.put('/:id/registrar-resultado', auth, async (req, res) => {
+  const { id } = req.params;
+  const { puntosLocal, puntosVisitante } = req.body;
+
+  try {
+    const partido = await Partido.findById(id);
+    if (!partido) {
+      return res.status(404).json({ msg: 'Partido no encontrado' });
+    }
+
+    // Actualizar resultado
+    partido.resultado.puntosLocal = puntosLocal;
+    partido.resultado.puntosVisitante = puntosVisitante;
+    partido.estado = 'jugado';
+
+    // ✅ Determinar ganador correctamente
+    if (puntosLocal > puntosVisitante) {
+      partido.resultado.ganador = partido.equipoLocal; // ✅ Equipo local ganó
+    } else if (puntosVisitante > puntosLocal) {
+      partido.resultado.ganador = partido.equipoVisitante; // ✅ Equipo visitante ganó
+    } else {
+      partido.resultado.ganador = null; // Empate
+    }
+
+    await partido.save();
+
+    res.json({
+      msg: 'Resultado registrado correctamente',
+      partido
+    });
+  } catch (err) {
+    console.error('❌ Error al registrar resultado:', err.message);
+    res.status(500).send('Error en el servidor');
+  }
+});
+
+/**
+ * GET /api/partidos/jugador/:cedula - Obtener partidos del jugador
+ */
+router.get('/jugador/:cedula', auth, async (req, res) => {
+  try {
+    const { cedula } = req.params;
+
+    // Buscar equipo donde el jugador esté (como capitán o en jugadores)
+    const equipo = await Equipo.findOne({
+      $or: [
+        { 'capitán.cedula': cedula },
+        { 'jugadores.cedula': cedula }
+      ]
+    });
+
+    if (!equipo) {
+      return res.json({ partidos: [] });
+    }
+
+    // Obtener partidos donde el equipo sea local o visitante
+    const partidos = await Partido.find({
+      $or: [
+        { equipoLocal: equipo._id },
+        { equipoVisitante: equipo._id }
+      ]
+    })
+      .populate('equipoLocal', 'nombre')
+      .populate('equipoVisitante', 'nombre')
+      .populate('torneo', 'nombre')
+      .populate('resultado.ganador')
+      .sort({ fecha: 1, hora: 1 });
+
+    res.json({ partidos });
+  } catch (err) {
+    console.error('❌ Error al obtener partidos del jugador:', err.message);
+    res.status(500).send('Error en el servidor');
+  }
+});
+
+module.exports = router;
